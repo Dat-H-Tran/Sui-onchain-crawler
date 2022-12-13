@@ -15,20 +15,21 @@ const SORT_BY_LATEST: bool = true;
 async fn main() -> Result<(), anyhow::Error> {
     dotenv::dotenv()?;
     let database_url = env::var("DATABASE_URL")?;
-
-    // Create a connection pool
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
         .await?;
-    let last_timestamp = sqlx::query!("SELECT max(timestamp) FROM modules;")
-        .fetch_one(&pool)
+    sqlx::migrate!("db/migrations")
+        .run(&pool)
         .await?;
-    let last_timestamp = last_timestamp.max;
+
+    let last_timestamp = get_last_timestamp(&pool).await?;
 
     let network_version = get_network_version().await?;
 
     collect_package_ids(last_timestamp, &network_version, &pool).await?;
+
+    collect_package_contents().await?;
 
     Ok(())
 }
@@ -118,4 +119,21 @@ async fn get_network_version() -> Result<String, anyhow::Error> {
         .ok_or_else(|| anyhow::anyhow!("missing tag_name"))?;
 
     Ok(version.to_owned())
+}
+
+async fn get_last_timestamp(pool: &Pool<Postgres>) -> Result<Option<i64>, anyhow::Error> {
+    let last_timestamp = sqlx::query!("SELECT max(timestamp) FROM modules;")
+        .fetch_one(pool)
+        .await?;
+    Ok(last_timestamp.max)
+}
+
+async fn collect_package_contents() -> Result<(), anyhow::Error> {
+    // Paginated-ly load empty modules
+
+    // Get the contents of the package from sui
+
+    // Save the contents and let the trigger hash
+
+    todo!()
 }
