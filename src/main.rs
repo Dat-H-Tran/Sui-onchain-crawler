@@ -1,9 +1,13 @@
+mod prelude;
+
+use crate::prelude::*;
 use std::env;
 
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 
 const SUI_DEVNET_FULLNODE: &str = "https://fullnode.devnet.sui.io:443";
+const SUI_RELEASES_API: &str = "https://api.github.com/repos/MystenLabs/sui/releases";
 const ENTRIES_PER_PAGE: usize = 1000;
 const SORT_BY_LATEST: bool = true;
 
@@ -17,15 +21,26 @@ async fn main() -> Result<(), anyhow::Error> {
         .max_connections(5)
         .connect(&database_url)
         .await?;
-
     let last_timestamp = sqlx::query!("SELECT max(timestamp) FROM modules;")
         .fetch_one(&pool)
         .await?;
     let last_timestamp = last_timestamp.max;
-    let mut crawling = true;
 
+    let network_version = get_network_version().await?;
+
+    collect_package_ids(last_timestamp, &network_version, &pool).await?;
+
+    Ok(())
+}
+
+async fn collect_package_ids(
+    last_timestamp: Option<i64>,
+    network_version: &str,
+    pool: &Pool<Postgres>,
+) -> Result<(), anyhow::Error> {
     let client = reqwest::Client::new().post(SUI_DEVNET_FULLNODE);
     let mut next_page = Value::Null;
+    let mut crawling = true;
 
     while crawling {
         let response = client
@@ -44,53 +59,63 @@ async fn main() -> Result<(), anyhow::Error> {
             }))
             .send()
             .await?;
-        let response_json = response.json::<Value>().await?;
-        let result = &response_json["result"];
-        let data = result["data"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("Response does not contain `result`."))?;
-        let next = result["nextCursor"].to_string();
+        let response = response.json::<SuiResponse>().await?;
+        let result = response.result;
+        let data = result.data;
+        let next = result.next_cursor.to_string();
 
         for object in data.iter() {
-            let sender = object["event"]["publish"]["sender"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Response does not contain `sender`."))?;
-            let package_id = object["event"]["publish"]["packageId"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Response does not contain `packageId`."))?;
-            let tx_digest = object["txDigest"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Response does not contain `txDigest`."))?;
-            let timestamp = object["timestamp"]
-                .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("Response does not contain `timestamp`."))?;
+            let sender = &object.event.publish.sender;
+            let package_id = &object.event.publish.package_id;
+            let tx_digest = &object.tx_digest;
+            let timestamp = &object.timestamp;
             println!("{sender} published {package_id} at {timestamp}");
 
             if let Some(last_ts) = last_timestamp {
-                if timestamp <= last_ts as u64 {
+                if timestamp <= &last_ts {
                     crawling = false;
                     break;
                 }
             }
 
-            // Make a simple query to return the given parameter (use a question mark `?` instead of `$1` for MySQL)
             let _row = sqlx::query!(
-                "INSERT INTO modules(package_id, sender, tx_digest, timestamp) VALUES ($1, $2, $3, $4)",
+                "INSERT INTO modules(package_id, sender, tx_digest, timestamp, network_version)\
+                 VALUES ($1, $2, $3, $4, $5)",
                 package_id,
                 sender,
                 tx_digest,
-                timestamp as i64
+                timestamp,
+                network_version
             )
-            .execute(&pool)
+            .execute(pool)
             .await?;
         }
         println!("{next}");
 
-        next_page = result["nextCursor"].clone();
+        next_page = result.next_cursor.clone();
         if next_page.is_null() {
             break;
         }
     }
 
     Ok(())
+}
+
+async fn get_network_version() -> Result<String, anyhow::Error> {
+    let github_api_token = env::var("GITHUB_API_TOKEN")?;
+    let response = reqwest::Client::new()
+        .get(SUI_RELEASES_API)
+        .header("User-Agent", "")
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("Authorization", format!("Bearer {github_api_token}"))
+        .send()
+        .await?;
+
+    let response_json = response.json::<Vec<Value>>().await?;
+    let version = response_json[0]["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing tag_name"))?;
+
+    Ok(version.to_owned())
 }

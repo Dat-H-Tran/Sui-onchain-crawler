@@ -9,6 +9,7 @@ edition = "2021"
 anyhow = { version = "1.0.66", features = ["backtrace"] }
 dotenv = "0.15.0"
 reqwest = { version = "0.11.13", features = ["json"] }
+serde = "1.0.150"
 serde_json = "1.0.89"
 sqlx = { version = "0.6", features = [ "runtime-tokio-native-tls" , "postgres" ] }
 tokio = { version = "1", features = ["full"] }
