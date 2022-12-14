@@ -3,6 +3,7 @@ mod prelude;
 use crate::prelude::*;
 use std::env;
 
+use anyhow::bail;
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 
@@ -19,9 +20,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .max_connections(5)
         .connect(&database_url)
         .await?;
-    sqlx::migrate!("db/migrations")
-        .run(&pool)
-        .await?;
+    sqlx::migrate!("db/migrations").run(&pool).await?;
 
     let last_timestamp = get_last_timestamp(&pool).await?;
 
@@ -29,7 +28,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     collect_package_ids(last_timestamp, &network_version, &pool).await?;
 
-    collect_package_contents().await?;
+    collect_package_contents(&pool).await?;
 
     Ok(())
 }
@@ -61,16 +60,16 @@ async fn collect_package_ids(
             .send()
             .await?;
         let response = response.json::<SuiResponse>().await?;
-        let result = response.result;
-        let data = result.data;
-        let next = result.next_cursor.to_string();
+        let SuiResult::Event { data, next_cursor } = response.result else {
+            bail!("Not an event")
+        };
 
+        let mut num_of_ids = 0;
         for object in data.iter() {
             let sender = &object.event.publish.sender;
             let package_id = &object.event.publish.package_id;
             let tx_digest = &object.tx_digest;
             let timestamp = &object.timestamp;
-            println!("{sender} published {package_id} at {timestamp}");
 
             if let Some(last_ts) = last_timestamp {
                 if timestamp <= &last_ts {
@@ -80,7 +79,7 @@ async fn collect_package_ids(
             }
 
             let _row = sqlx::query!(
-                "INSERT INTO modules(package_id, sender, tx_digest, timestamp, network_version)\
+                "INSERT INTO sui_packages(package_id, sender, tx_digest, timestamp, network_version)\
                  VALUES ($1, $2, $3, $4, $5)",
                 package_id,
                 sender,
@@ -90,10 +89,12 @@ async fn collect_package_ids(
             )
             .execute(pool)
             .await?;
-        }
-        println!("{next}");
 
-        next_page = result.next_cursor.clone();
+            num_of_ids += 1;
+        }
+        println!("Collected {num_of_ids} package ids...");
+
+        next_page = next_cursor.clone();
         if next_page.is_null() {
             break;
         }
@@ -122,18 +123,59 @@ async fn get_network_version() -> Result<String, anyhow::Error> {
 }
 
 async fn get_last_timestamp(pool: &Pool<Postgres>) -> Result<Option<i64>, anyhow::Error> {
-    let last_timestamp = sqlx::query!("SELECT max(timestamp) FROM modules;")
+    let last_timestamp = sqlx::query!("SELECT max(timestamp) FROM sui_packages;")
         .fetch_one(pool)
         .await?;
     Ok(last_timestamp.max)
 }
 
-async fn collect_package_contents() -> Result<(), anyhow::Error> {
+async fn collect_package_contents(pool: &Pool<Postgres>) -> Result<(), anyhow::Error> {
     // Paginated-ly load empty modules
+    let batch = sqlx::query!("SELECT package_id FROM sui_packages WHERE content IS NULL")
+        .fetch_all(pool)
+        .await?;
+    let batch = batch
+        .iter()
+        .map(|record| record.package_id.as_ref().unwrap())
+        .collect::<Vec<_>>();
 
     // Get the contents of the package from sui
+    let client = reqwest::Client::new().post(SUI_DEVNET_FULLNODE);
 
-    // Save the contents and let the trigger hash
+    for (index, package_id) in batch.iter().enumerate() {
+        let package_id = *package_id;
 
-    todo!()
+        let response = client
+            .try_clone()
+            .unwrap()
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sui_getObject",
+                "params": [
+                    package_id
+                ]
+            }))
+            .send()
+            .await?;
+
+        let response = response.json::<SuiResponse>().await?;
+        let SuiResult::Package { details, .. } = response.result else {
+            bail!("Not a package")
+        };
+        let map = details.data.disassembled;
+
+        let _affected_rows = sqlx::query!(
+            "UPDATE sui_packages SET content = $1 WHERE package_id = $2",
+            format!("{map:?}"),
+            package_id
+        )
+        .execute(pool)
+        .await?;
+
+        if index % 50 == 0 {
+            println!("Saved {} packages...", index + 1);
+        }
+    }
+    Ok(())
 }

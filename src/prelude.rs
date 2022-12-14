@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -7,20 +9,37 @@ pub struct SuiResponse {
 }
 
 #[derive(Deserialize, Debug)]
-pub struct SuiResult {
-    pub data: Vec<SuiData>,
-    
-    #[serde(rename = "nextCursor")]
-    pub next_cursor: Value,
+#[serde(untagged)]
+pub enum SuiResult {
+    Event {
+        data: Vec<SuiEventData>,
+
+        #[serde(rename = "nextCursor")]
+        next_cursor: Value,
+    },
+    Package {
+        status: String,
+        details: SuiPackageDetails,
+    },
 }
 
 #[derive(Deserialize, Debug)]
-pub struct SuiData {
+pub struct SuiPackageDetails {
+    pub data: SuiPackageData,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct SuiPackageData {
+    #[serde(rename = "dataType")]
+    pub data_type: String,
+    pub disassembled: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct SuiEventData {
     #[serde(rename = "txDigest")]
     pub tx_digest: String,
-    
     pub timestamp: i64,
-    
     pub event: SuiPublishEvent,
 }
 
@@ -32,7 +51,7 @@ pub struct SuiPublishEvent {
 #[derive(Deserialize, Debug)]
 pub struct SuiPublishDetail {
     pub sender: String,
-    
+
     #[serde(rename = "packageId")]
     pub package_id: String,
 }
